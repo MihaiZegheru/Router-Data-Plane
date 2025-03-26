@@ -54,3 +54,11 @@ dkms.conf
 # Specific
 hosts_output
 router
+
+# Testing files
+router0
+router1
+router_0_err
+router_0_out
+router_1_err
+router_1_out

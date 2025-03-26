@@ -18,15 +18,14 @@ int arp_table_len;
 
 struct route_table_entry *get_best_route(uint32_t ip_dest) {
     struct route_table_entry *best_match = NULL;
-    long dip = ntohl(ip_dest); 
+    uint32_t dip = ntohl(ip_dest); 
 
     for (int i = 0; i < route_table_len; i++) {
-        long prefix = ntohl(route_table[i].prefix);
-        long mask = ntohl(route_table[i].mask);
+        uint32_t prefix = ntohl(route_table[i].prefix);
+        uint32_t mask = ntohl(route_table[i].mask);
 
-        if ((dip & mask) == prefix) {  // Check if it matches
-            if (!best_match || mask > ntohl(best_match->mask)) {  
-                // Update if it's a more specific match
+        if ((dip & mask) == prefix) {
+            if (!best_match || mask > ntohl(best_match->mask)) {
                 best_match = &route_table[i];
             }
         }
@@ -36,14 +35,14 @@ struct route_table_entry *get_best_route(uint32_t ip_dest) {
 
 struct arp_table_entry *get_arp_entry(uint32_t given_ip) {
     for (int i = 0; i < arp_table_len; i++) {
-        if (arp_table[i].ip == given_ip) {  // IPs are stored in network order
+        if (arp_table[i].ip == given_ip) {
             return &arp_table[i];
         }
     }
-    return NULL;  // No matching entry found
+    return NULL;
 }
 
-void initialise_tables() {
+void initialise_tables(char* rpath) {
 	/* Allocate memory for the route_table and arp_table */
 	route_table = malloc(sizeof(struct route_table_entry) * 64300);
 	DIE(route_table == NULL, "malloc route_table");
@@ -52,7 +51,7 @@ void initialise_tables() {
 	DIE(arp_table == NULL, "malloc arp_table");
 	
 	/* Read the static routing table and the ARP table */
-	route_table_len = read_rtable("rtable0.txt", route_table);
+	route_table_len = read_rtable(rpath, route_table);
 	arp_table_len = parse_arp_table("arp_table.txt", arp_table);
 }
 
@@ -63,7 +62,7 @@ int main(int argc, char *argv[])
 	// Do not modify this line
 	init(argv + 2, argc - 2);
 
-	initialise_tables();
+	initialise_tables(argv[1]);
 
 	while (1) {
 		size_t interface;
@@ -94,12 +93,29 @@ int main(int argc, char *argv[])
 		}
 		printf("Got an IPv4 packet.\n");
 
+		/* Verify IP checksum */
+        if (checksum((uint16_t *)ip_hdr, sizeof(struct ip_hdr)) != 0) {
+            printf("Dropping packet: invalid checksum\n");
+            continue;
+        }
+
 		/* Find the best route. Drop packet if fail. */
 		struct route_table_entry* route = get_best_route(ip_hdr->dest_addr);
 		if (!route) {
 			printf("Dropping packet: No route found\n");
 			continue;
 		}
+
+		/* Check TTL */
+        if (ip_hdr->ttl <= 1) {
+            printf("Dropping packet: TTL expired\n");
+            continue;
+        }
+        ip_hdr->ttl--;
+
+        /* Recompute checksum */
+		ip_hdr->checksum = 0;
+        ip_hdr->checksum = htons(checksum((uint16_t *)ip_hdr, sizeof(struct ip_hdr)));
 
 		/* Get destination MAC address (static ARP table) */
 		struct arp_table_entry* dest_mac = get_arp_entry(route->next_hop);
@@ -117,7 +133,7 @@ int main(int argc, char *argv[])
 		/* Send the packet */
 		int res = send_to_link(len, buf, route->interface);
 
-		printf("Should have sent. %d\n", res);
+		printf("Package forwarded. %d\n", res);
 	}
 }
 
