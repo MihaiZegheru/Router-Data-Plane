@@ -16,6 +16,26 @@ int route_table_len;
 struct arp_table_entry *arp_table;
 int arp_table_len;
 
+struct packet_data {
+	char *buf;
+	size_t len;
+	struct ether_hdr *eth_hdr;
+	struct ip_hdr *ip_hdr;
+	struct icmp_hdr *icmp_hdr;
+};
+
+struct packet_data packet_data_init(void *buf, size_t len) {
+	struct packet_data pkt = {
+		.buf = buf,
+		.len = len,
+		.eth_hdr = (struct ether_hdr*)buf,
+		.ip_hdr = (struct ip_hdr *)(buf + sizeof(struct ether_hdr)),
+		.icmp_hdr = NULL
+	};
+
+	return pkt;
+}
+
 struct route_table_entry *get_best_route(uint32_t ip_dest) {
     struct route_table_entry *best_match = NULL;
     uint32_t dip = ntohl(ip_dest); 
@@ -55,8 +75,71 @@ void initialise_tables(char* rpath) {
 	arp_table_len = parse_arp_table("arp_table.txt", arp_table);
 }
 
-int main(int argc, char *argv[])
-{
+void handle_icmp(void *buf, uint8_t type, uint8_t code) {
+	struct ether_hdr *eth_hdr = (struct ether_hdr *)buf;
+	struct ip_hdr *ip_hdr = (struct ip_hdr *)(buf + sizeof(struct ether_hdr));
+	struct icmp_hdr *icmp_hdr = (struct icmp_hdr *)(buf +
+													sizeof(struct ether_hdr) +
+													sizeof(struct ip_hdr));
+
+	icmp_hdr->mtype = type;
+	icmp_hdr->mcode = code;
+	icmp_hdr->check = 0;
+	icmp_hdr->check = checksum((uint16_t *)icmp_hdr, sizeof(struct icmp_hdr));
+}
+
+void handle_ipv4(struct packet_data pkt) {
+	printf("Handling IPv4 packet.\n");
+
+	/* Check if we got an ICMP packet. */
+	if (pkt.ip_hdr->proto == IPPROTO_ICMP) {
+
+	}
+
+	/* Verify IP checksum */
+	if (checksum((uint16_t *)pkt.ip_hdr, sizeof(struct ip_hdr)) != 0) {
+		printf("Dropping packet: invalid checksum\n");
+		return;
+	}
+
+	/* Find the best route. Drop packet if fail. */
+	struct route_table_entry* route = get_best_route(pkt.ip_hdr->dest_addr);
+	if (!route) {
+		printf("Dropping packet: No route found\n");
+		return;
+	}
+
+	/* Check TTL */
+	if (pkt.ip_hdr->ttl <= 1) {
+		printf("Dropping packet: TTL expired\n");
+		return;
+	}
+	pkt.ip_hdr->ttl--;
+
+	/* Recompute checksum */
+	pkt.ip_hdr->checksum = 0;
+	pkt.ip_hdr->checksum = htons(checksum((uint16_t *)pkt.ip_hdr, sizeof(struct ip_hdr)));
+
+	/* Get destination MAC address (static ARP table) */
+	struct arp_table_entry* dest_mac = get_arp_entry(route->next_hop);
+	if (!dest_mac) {
+		printf("Dropping packet: MAC entry not found for IP %u\n", route->next_hop);
+		return;
+	}
+
+	/* Get source MAC address */
+	get_interface_mac(route->interface, pkt.eth_hdr->ethr_shost);
+	
+	/* Update Ethernet header */
+	memcpy(pkt.eth_hdr->ethr_dhost, dest_mac->mac, 6);
+
+	/* Send the packet */
+	int res = send_to_link(pkt.len, pkt.buf, route->interface);
+
+	printf("Package forwarded. %d\n", res);
+}
+
+int main(int argc, char *argv[]) {
 	char buf[MAX_PACKET_LEN];
 
 	// Do not modify this line
@@ -80,60 +163,15 @@ int main(int argc, char *argv[])
 
 		printf("Packet received!\n");
 
-		struct ether_hdr *eth_hdr = (struct ether_hdr*) buf;
-
-		struct ip_hdr *ip_hdr = (struct ip_hdr*)(buf + sizeof(struct ether_hdr));
-
-		// TODO: Change to accept other types.
+		struct packet_data pkt = packet_data_init(buf, len);
 
 		/* Check if we got an IPv4 packet, else drop packet. */
-		if (eth_hdr->ethr_type != ntohs(ETHERTYPE_IP)) {
+		if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_IP) {
+			handle_ipv4(pkt);
+		} else {
 			printf("Ignored non-IPv4 packet\n");
 			continue;
 		}
-		printf("Got an IPv4 packet.\n");
-
-		/* Verify IP checksum */
-        if (checksum((uint16_t *)ip_hdr, sizeof(struct ip_hdr)) != 0) {
-            printf("Dropping packet: invalid checksum\n");
-            continue;
-        }
-
-		/* Find the best route. Drop packet if fail. */
-		struct route_table_entry* route = get_best_route(ip_hdr->dest_addr);
-		if (!route) {
-			printf("Dropping packet: No route found\n");
-			continue;
-		}
-
-		/* Check TTL */
-        if (ip_hdr->ttl <= 1) {
-            printf("Dropping packet: TTL expired\n");
-            continue;
-        }
-        ip_hdr->ttl--;
-
-        /* Recompute checksum */
-		ip_hdr->checksum = 0;
-        ip_hdr->checksum = htons(checksum((uint16_t *)ip_hdr, sizeof(struct ip_hdr)));
-
-		/* Get destination MAC address (static ARP table) */
-		struct arp_table_entry* dest_mac = get_arp_entry(route->next_hop);
-		if (!dest_mac) {
-			printf("Dropping packet: MAC entry not found for IP %u\n", route->next_hop);
-			continue;
-		}
-
-		/* Get source MAC address */
-		get_interface_mac(route->interface, eth_hdr->ethr_shost);
-		
-		/* Update Ethernet header */
-		memcpy(eth_hdr->ethr_dhost, dest_mac->mac, 6);
-
-		/* Send the packet */
-		int res = send_to_link(len, buf, route->interface);
-
-		printf("Package forwarded. %d\n", res);
 	}
 }
 
