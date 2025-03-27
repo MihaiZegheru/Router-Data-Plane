@@ -8,6 +8,10 @@
 #define ETHERTYPE_IP		0x0800	/* IP protocol */
 #endif
 
+#ifndef ETHERTYPE_ARP
+#define ETHERTYPE_ARP 		0x0806  /* ARP protocol */
+#endif
+
 char cpybuf[100];
 
 /* Routing table */
@@ -21,7 +25,6 @@ int arp_table_len;
 struct packet_data {
 	char *buf;
 	size_t len;
-
 	size_t interface;
 
 	struct ether_hdr *eth_hdr;
@@ -42,13 +45,16 @@ struct packet_data packet_data_init(void *buf, size_t len, size_t interface) {
 }
 
 void packet_data_insert_icmp_hdr(struct packet_data *pkt) {
+	/* Shift memory in order to make space for the ICMP header */
 	memcpy(cpybuf, pkt->ip_hdr + sizeof(struct ip_hdr),
 		   sizeof(struct icmp_hdr));
 	memcpy(pkt->ip_hdr + sizeof(struct ip_hdr) + sizeof(struct icmp_hdr),
 		   cpybuf, sizeof(struct icmp_hdr));
+
 	pkt->icmp_hdr = (struct icmp_hdr *)(pkt->buf + sizeof(struct ether_hdr) +
 										sizeof(struct ip_hdr));
 
+	/* Update IPv4 header to accomodate ICMP */
 	pkt->ip_hdr->tot_len = htons(ntohs(pkt->ip_hdr->tot_len) +
 								 sizeof(struct icmp_hdr));
 	pkt->ip_hdr->proto = IPPROTO_ICMP;
@@ -83,10 +89,11 @@ struct arp_table_entry *get_arp_entry(uint32_t given_ip) {
 }
 
 void initialise_tables(char* rpath) {
-	/* Allocate memory for the route_table and arp_table */
+	/* Allocate memory for the route_table */
 	route_table = malloc(sizeof(struct route_table_entry) * 64300);
 	DIE(route_table == NULL, "malloc route_table");
 
+	/* Allocate memory for the arp_table */
 	arp_table = malloc(sizeof(struct arp_table_entry) * 10);
 	DIE(arp_table == NULL, "malloc arp_table");
 	
@@ -102,29 +109,31 @@ void handle_icmp(struct packet_data *pkt, uint8_t type, uint8_t code) {
 	pkt->icmp_hdr->mtype = type;
 	pkt->icmp_hdr->mcode = code;
 
+	/* Update IPv4 header */
 	pkt->ip_hdr->dest_addr = pkt->ip_hdr->source_addr;
 	pkt->ip_hdr->source_addr = inet_addr(get_interface_ip(pkt->interface));
 	pkt->ip_hdr->ttl = 64;
 
-
+	/* Recompute ICMP checksum */
 	pkt->icmp_hdr->check = 0;
 	pkt->icmp_hdr->check = htons(checksum((uint16_t *)pkt->icmp_hdr,
 										  pkt->len - sizeof(struct ether_hdr) - 
 										  sizeof(struct ip_hdr)));
+
+	/* Recompute IPv4 checksum */
 	pkt->ip_hdr->checksum = 0;
 	pkt->ip_hdr->checksum = htons(checksum((uint16_t *)pkt->ip_hdr,
 										   sizeof(struct ip_hdr)));
 
 	/* Update Ethernet header */
 	memcpy(pkt->eth_hdr->ethr_dhost, pkt->eth_hdr->ethr_shost, 6);
-	/* Get source MAC address */
 	get_interface_mac(pkt->interface, pkt->eth_hdr->ethr_shost);
 	pkt->eth_hdr->ethr_type = htons(ETHERTYPE_IP);
 
 	/* Send the packet */
-	int res = send_to_link(pkt->len, pkt->buf, pkt->interface);
+	send_to_link(pkt->len, pkt->buf, pkt->interface);
 
-	printf("Package sent therough ICMP. %d\n", res);
+	printf("Package sent as ICMP.\n");
 }
 
 int check_icmp_for_self(struct packet_data *pkt) {
@@ -190,9 +199,9 @@ void handle_ipv4(struct packet_data *pkt) {
 	memcpy(pkt->eth_hdr->ethr_dhost, dest_mac->mac, 6);
 
 	/* Send the packet */
-	int res = send_to_link(pkt->len, pkt->buf, route->interface);
+	send_to_link(pkt->len, pkt->buf, route->interface);
 
-	printf("Package forwarded. %d\n", res);
+	printf("Package forwarded.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -210,22 +219,17 @@ int main(int argc, char *argv[]) {
 		interface = recv_from_any_link(buf, &len);
 		DIE(interface < 0, "recv_from_any_links");
 
-		// TODO: Implement the router forwarding logic
-
-		/* Note that packets received are in network order,
-			any header field which has more than 1 byte will need to be conerted to
-			host order. For example, ntohs(eth_hdr->ether_type). The oposite is needed when
-			sending a packet on the link, */
-
-		printf("Packet received!\n");
+		printf("Received packet\n");
 
 		struct packet_data pkt = packet_data_init(buf, len, interface);
 
-		/* Check if we got an IPv4 packet, else drop packet. */
+		/* Check for IPv4 or ARP packet, else drop packet. */
 		if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_IP) {
 			handle_ipv4(&pkt);
+		} else if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_ARP) {
+
 		} else {
-			printf("Ignored non-IPv4 packet\n");
+			printf("Dropping packet: Protocol unknown\n");
 			continue;
 		}
 	}
