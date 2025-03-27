@@ -12,7 +12,16 @@
 #define ETHERTYPE_ARP 		0x0806  /* ARP protocol */
 #endif
 
+#ifndef ARP_REQUEST
+#define ARP_REQUEST 		1
+#endif
+
+#ifndef ARP_REPLY
+#define ARP_REPLY 			2
+#endif
+
 char cpybuf[100];
+char sbuf[MAX_PACKET_LEN];
 
 /* Routing table */
 struct route_table_entry *route_table;
@@ -22,6 +31,9 @@ int route_table_len;
 struct arp_table_entry *arp_table;
 int arp_table_len;
 
+/* Packet queue */
+queue packet_queue;
+
 struct packet_data {
 	char *buf;
 	size_t len;
@@ -30,6 +42,7 @@ struct packet_data {
 	struct ether_hdr *eth_hdr;
 	struct ip_hdr *ip_hdr;
 	struct icmp_hdr *icmp_hdr;
+	struct arp_hdr *arp_hdr;
 };
 
 struct packet_data packet_data_init(void *buf, size_t len, size_t interface) {
@@ -38,10 +51,39 @@ struct packet_data packet_data_init(void *buf, size_t len, size_t interface) {
 		.len = len,
 		.interface = interface,
 		.eth_hdr = (struct ether_hdr*)buf,
-		.ip_hdr = (struct ip_hdr *)(buf + sizeof(struct ether_hdr)),
-		.icmp_hdr = NULL
+		.ip_hdr = NULL,
+		.icmp_hdr = NULL,
+		.arp_hdr = NULL
 	};
 	return pkt;
+}
+
+struct waiting_packet {
+	char pktbuf[MAX_PACKET_LEN];
+	struct packet_data pkt;
+	struct route_table_entry *route;
+};
+
+struct waiting_packet *on_hold_packet_init(struct packet_data *pkt,
+										   struct route_table_entry *route) {
+	struct waiting_packet *wp = malloc(sizeof(struct waiting_packet));
+
+	memcpy(wp->pktbuf, pkt->buf, MAX_PACKET_LEN);
+	wp->route = route;
+
+	wp->pkt.buf = wp->pktbuf;
+	wp->pkt.len = pkt->len;
+	wp->pkt.interface = pkt->interface;
+	wp->pkt.eth_hdr = pkt->eth_hdr;
+	wp->pkt.ip_hdr = pkt->ip_hdr;
+	wp->pkt.icmp_hdr = pkt->icmp_hdr;
+	wp->pkt.arp_hdr = pkt->arp_hdr;
+
+	return wp;
+}
+
+void on_hold_packet_destory(struct waiting_packet *wp) {
+	free(wp);
 }
 
 void packet_data_insert_icmp_hdr(struct packet_data *pkt) {
@@ -94,12 +136,136 @@ void initialise_tables(char* rpath) {
 	DIE(route_table == NULL, "malloc route_table");
 
 	/* Allocate memory for the arp_table */
-	arp_table = malloc(sizeof(struct arp_table_entry) * 10);
+	arp_table = malloc(sizeof(struct arp_table_entry) * 100);
 	DIE(arp_table == NULL, "malloc arp_table");
 	
 	/* Read the static routing table and the ARP table */
 	route_table_len = read_rtable(rpath, route_table);
-	arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+	// arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+}
+
+void send_arp_request(struct route_table_entry *route) {
+	/* Create and initialise ARP packet */
+	struct packet_data pkt = 
+			packet_data_init(sbuf, 
+							 sizeof(struct ether_hdr) + sizeof(struct arp_hdr), 
+							 route->interface);
+	pkt.arp_hdr = (struct arp_hdr *)(pkt.buf + sizeof(struct ether_hdr));
+
+	/* Set ARP protocol type */
+	pkt.eth_hdr->ethr_type = htons(ETHERTYPE_ARP);
+
+	/* Set ARP protocol parameters */
+	pkt.arp_hdr->hw_type = htons(1);
+	pkt.arp_hdr->proto_type = htons(ETHERTYPE_IP);
+	pkt.arp_hdr->hw_len = 6;
+	pkt.arp_hdr->proto_len = 4;
+	pkt.arp_hdr->opcode = htons(ARP_REQUEST);
+
+	pkt.arp_hdr->sprotoa = inet_addr(get_interface_ip(route->interface));
+	pkt.arp_hdr->tprotoa = route->next_hop;
+	get_interface_mac(route->interface, pkt.arp_hdr->shwa);
+
+	/* Set MAC addresses */
+	get_interface_mac(route->interface, pkt.eth_hdr->ethr_shost);
+	memset(pkt.eth_hdr->ethr_dhost, 0xFF, 6);
+
+	/* Send the packet */
+	send_to_link(pkt.len, pkt.buf, pkt.interface);
+
+	printf("Package sent as ARP request.\n");
+}
+
+void handle_arp_request(struct packet_data *pkt) {
+	pkt->arp_hdr->opcode = htons(ARP_REPLY);
+
+	/* Swap the IP addresses */
+	pkt->arp_hdr->tprotoa = pkt->arp_hdr->sprotoa;
+	pkt->arp_hdr->sprotoa = inet_addr(get_interface_ip(pkt->interface));
+
+	/* Set MAC addresses for ARP request */
+	memcpy(pkt->arp_hdr->thwa, pkt->arp_hdr->shwa, 6);
+	get_interface_mac(pkt->interface, pkt->arp_hdr->shwa);
+
+	/* Swap the MAC addresses for Ethernet */
+	memcpy(pkt->eth_hdr->ethr_dhost, pkt->eth_hdr->ethr_shost, 6);
+	get_interface_mac(pkt->interface, pkt->eth_hdr->ethr_shost);
+
+	/* Send the packet */
+	send_to_link(pkt->len, pkt->buf, pkt->interface);
+
+	printf("Package sent as ARP response.\n");
+}
+
+void handle_arp_reply(struct packet_data *pkt) {
+	/* Check if ARP entry already exists */
+	int exists = 0;
+	for (int i = 0; i < arp_table_len; i++) {
+		if (arp_table[i].ip == pkt->arp_hdr->sprotoa) {
+			exists = 1;
+			break;
+		}
+	}
+	if (exists) {
+		return;
+	}
+
+	/* Handle adding ARP entry and sending queued packages */
+	arp_table[arp_table_len].ip = pkt->arp_hdr->sprotoa;
+	memcpy(arp_table[arp_table_len++].mac, pkt->arp_hdr->shwa, 6);
+	printf("ADDED ARP");
+	size_t size = queue_size(packet_queue);
+
+	while (size--) {
+		struct waiting_packet *wp = queue_deq(packet_queue);
+
+		/* Search for ARP entry match */
+		int arp_idx = -1;
+		
+		for (int i = 0; i < arp_table_len; i++) {
+			if (arp_table[i].ip == wp->route->next_hop) {
+				arp_idx = i;
+				break;
+			}
+		}
+
+		/* If ARP entry not found, enqueue packet back */
+		if (arp_idx == -1) {
+			queue_enq(packet_queue, wp);
+			continue;
+		}
+
+		/* Set MAC address */
+		memcpy(wp->pkt.eth_hdr->ethr_dhost, arp_table[arp_idx].mac, 6);
+		for (int i = 0; i < 6; i++) {
+			printf("%x", wp->pkt.eth_hdr->ethr_dhost[i]);
+		}
+		printf("\n");
+
+		/* Send the packet */
+		send_to_link(wp->pkt.len, wp->pkt.buf, wp->route->interface);
+
+		printf("Package sent after ARP resolve.\n");
+
+		on_hold_packet_destory(wp);
+	}
+}
+
+void handle_arp(struct packet_data *pkt) {
+	printf("Handling ARP packet.\n");
+
+	pkt->arp_hdr = (struct arp_hdr *)(pkt->buf + sizeof(struct ether_hdr));
+
+	switch(ntohs(pkt->arp_hdr->opcode)) {
+		case ARP_REQUEST:
+			handle_arp_request(pkt);
+			break;
+		case ARP_REPLY:
+			handle_arp_reply(pkt);
+			break;
+		default:
+			printf("Dropping packet: ARP opcode not supported\n");
+	}
 }
 
 void handle_icmp(struct packet_data *pkt, uint8_t type, uint8_t code) {
@@ -149,6 +315,8 @@ int check_icmp_for_self(struct packet_data *pkt) {
 void handle_ipv4(struct packet_data *pkt) {
 	printf("Handling IPv4 packet.\n");
 
+	pkt->ip_hdr = (struct ip_hdr *)(pkt->buf + sizeof(struct ether_hdr));
+
 	/* Verify IP checksum */
 	if (checksum((uint16_t *)pkt->ip_hdr, sizeof(struct ip_hdr)) != 0) {
 		printf("Dropping packet: invalid checksum\n");
@@ -184,16 +352,23 @@ void handle_ipv4(struct packet_data *pkt) {
 	pkt->ip_hdr->checksum = htons(checksum((uint16_t *)pkt->ip_hdr,
 										   sizeof(struct ip_hdr)));
 
+	/* Get source MAC address */
+	get_interface_mac(route->interface, pkt->eth_hdr->ethr_shost);
+
 	/* Get destination MAC address (static ARP table) */
 	struct arp_table_entry* dest_mac = get_arp_entry(route->next_hop);
 	if (!dest_mac) {
-		printf("Dropping packet: MAC entry not found for IP %u\n",
+		printf("MAC entry not found for IP %u: Sending ARP message\n",
 			   route->next_hop);
+		
+		/* Add packet to queue */
+		struct waiting_packet *wp = on_hold_packet_init(pkt, route);
+		queue_enq(packet_queue, wp);
+
+		/* Send ARP request */
+		send_arp_request(route);
 		return;
 	}
-
-	/* Get source MAC address */
-	get_interface_mac(route->interface, pkt->eth_hdr->ethr_shost);
 	
 	/* Update Ethernet header */
 	memcpy(pkt->eth_hdr->ethr_dhost, dest_mac->mac, 6);
@@ -211,6 +386,7 @@ int main(int argc, char *argv[]) {
 	init(argv + 2, argc - 2);
 
 	initialise_tables(argv[1]);
+	packet_queue = create_queue();
 
 	while (1) {
 		size_t interface;
@@ -227,7 +403,7 @@ int main(int argc, char *argv[]) {
 		if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_IP) {
 			handle_ipv4(&pkt);
 		} else if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_ARP) {
-
+			handle_arp(&pkt);
 		} else {
 			printf("Dropping packet: Protocol unknown\n");
 			continue;

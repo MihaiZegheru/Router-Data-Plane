@@ -1,6 +1,8 @@
 #ifndef QUEUE_H
 #define QUEUE_H
 
+#include <stddef.h>
+
 struct queue;
 typedef struct queue *queue;
 
@@ -15,5 +17,8 @@ extern void *queue_deq(queue q);
 
 /* return a true value if and only if the queue is empty */
 extern int queue_empty(queue q);
+
+/* return queue size */
+extern size_t queue_size(queue q);
 
 #endif
