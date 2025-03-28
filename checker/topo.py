@@ -344,12 +344,12 @@ def main(run_tests=False, run=None):
         for (testname, test) in tests.TESTS.items():
             skipped = False
 
-            if should_skip(testname):
-                skipped = True
-                passed = False
-            else:
-                results = nm.run_test(testname)
-                passed = validate_test_results(results)
+            # if should_skip(testname):
+            #     skipped = True
+            #     passed = False
+            # else:
+            results = nm.run_test(testname)
+            passed = validate_test_results(results)
             str_status = "PASSED" if passed else "FAILED"
             if skipped:
                 str_status = "SKIPPED"

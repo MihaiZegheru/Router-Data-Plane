@@ -3,6 +3,7 @@
 #include "protocols.h"
 #include "queue.h"
 #include "lib.h"
+#include "trie.h"
 
 #ifndef ETHERTYPE_IP
 #define ETHERTYPE_IP		0x0800	/* IP protocol */
@@ -26,6 +27,7 @@ char sbuf[MAX_PACKET_LEN];
 /* Routing table */
 struct route_table_entry *route_table;
 int route_table_len;
+route_trie rtrie;
 
 /* ARP table */
 struct arp_table_entry *arp_table;
@@ -104,21 +106,28 @@ void packet_data_insert_icmp_hdr(struct packet_data *pkt) {
 	pkt->len += sizeof(struct icmp_hdr);
 }
 
-struct route_table_entry *get_best_route(uint32_t ip_dest) {
-    struct route_table_entry *best_match = NULL;
-    uint32_t dip = ntohl(ip_dest); 
+void print_ip(uint32_t ip) {
+    unsigned char bytes[4];
+	
+    bytes[0] = (ip >> 24) & 0xFF;
+    bytes[1] = (ip >> 16) & 0xFF;
+    bytes[2] = (ip >> 8)  & 0xFF;
+    bytes[3] = ip & 0xFF;
+    printf("%u.%u.%u.%u\n", bytes[0], bytes[1], bytes[2], bytes[3]);
+}
 
-    for (int i = 0; i < route_table_len; i++) {
-        uint32_t prefix = ntohl(route_table[i].prefix);
-        uint32_t mask = ntohl(route_table[i].mask);
-
-        if ((dip & mask) == prefix) {
-            if (!best_match || mask > ntohl(best_match->mask)) {
-                best_match = &route_table[i];
-            }
-        }
+uint32_t reverse_bits(uint32_t num) {
+    uint32_t reversed = 0;
+    for (int i = 0; i < 32; i++) {
+        reversed <<= 1;
+        reversed |= (num & 1);
+        num >>= 1;
     }
-    return best_match;
+    return reversed;
+}
+
+struct route_table_entry *get_best_route(uint32_t ip_dest) {
+	return trie_match(rtrie, reverse_bits(ntohl(ip_dest)));
 }
 
 struct arp_table_entry *get_arp_entry(uint32_t given_ip) {
@@ -141,7 +150,14 @@ void initialise_tables(char* rpath) {
 	
 	/* Read the static routing table and the ARP table */
 	route_table_len = read_rtable(rpath, route_table);
-	// arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+
+	/* Build route_trie */
+    for (int i = 0; i < route_table_len; i++) {
+        trie_insert(rtrie,
+					reverse_bits(ntohl(route_table[i].prefix)), 
+					reverse_bits(ntohl(route_table[i].mask)),
+					&route_table[i]);
+    }
 }
 
 void send_arp_request(struct route_table_entry *route) {
@@ -385,7 +401,9 @@ int main(int argc, char *argv[]) {
 	// Do not modify this line
 	init(argv + 2, argc - 2);
 
+	rtrie = create_trie();
 	initialise_tables(argv[1]);
+
 	packet_queue = create_queue();
 
 	while (1) {
