@@ -36,7 +36,7 @@ int arp_table_len;
 /* Packet queue */
 queue packet_queue;
 
-struct packet_data {
+struct packet {
 	char *buf;
 	size_t len;
 	size_t interface;
@@ -47,8 +47,8 @@ struct packet_data {
 	struct arp_hdr *arp_hdr;
 };
 
-struct packet_data packet_data_init(void *buf, size_t len, size_t interface) {
-	struct packet_data pkt = {
+struct packet packet_data_init(void *buf, size_t len, size_t interface) {
+	struct packet pkt = {
 		.buf = buf,
 		.len = len,
 		.interface = interface,
@@ -62,11 +62,11 @@ struct packet_data packet_data_init(void *buf, size_t len, size_t interface) {
 
 struct waiting_packet {
 	char pktbuf[MAX_PACKET_LEN];
-	struct packet_data pkt;
+	struct packet pkt;
 	struct route_table_entry *route;
 };
 
-struct waiting_packet *on_hold_packet_init(struct packet_data *pkt,
+struct waiting_packet *create_waiting_packet(struct packet *pkt,
 										   struct route_table_entry *route) {
 	struct waiting_packet *wp = malloc(sizeof(struct waiting_packet));
 
@@ -84,36 +84,8 @@ struct waiting_packet *on_hold_packet_init(struct packet_data *pkt,
 	return wp;
 }
 
-void on_hold_packet_destory(struct waiting_packet *wp) {
+void destroy_waiting_packet(struct waiting_packet *wp) {
 	free(wp);
-}
-
-void packet_data_insert_icmp_hdr(struct packet_data *pkt) {
-	/* Shift memory in order to make space for the ICMP header */
-	memcpy(cpybuf, pkt->ip_hdr + sizeof(struct ip_hdr),
-		   sizeof(struct icmp_hdr));
-	memcpy(pkt->ip_hdr + sizeof(struct ip_hdr) + sizeof(struct icmp_hdr),
-		   cpybuf, sizeof(struct icmp_hdr));
-
-	pkt->icmp_hdr = (struct icmp_hdr *)(pkt->buf + sizeof(struct ether_hdr) +
-										sizeof(struct ip_hdr));
-
-	/* Update IPv4 header to accomodate ICMP */
-	pkt->ip_hdr->tot_len = htons(ntohs(pkt->ip_hdr->tot_len) +
-								 sizeof(struct icmp_hdr));
-	pkt->ip_hdr->proto = IPPROTO_ICMP;
-
-	pkt->len += sizeof(struct icmp_hdr);
-}
-
-void print_ip(uint32_t ip) {
-    unsigned char bytes[4];
-	
-    bytes[0] = (ip >> 24) & 0xFF;
-    bytes[1] = (ip >> 16) & 0xFF;
-    bytes[2] = (ip >> 8)  & 0xFF;
-    bytes[3] = ip & 0xFF;
-    printf("%u.%u.%u.%u\n", bytes[0], bytes[1], bytes[2], bytes[3]);
 }
 
 uint32_t reverse_bits(uint32_t num) {
@@ -162,13 +134,13 @@ void initialise_tables(char* rpath) {
 
 void send_arp_request(struct route_table_entry *route) {
 	/* Create and initialise ARP packet */
-	struct packet_data pkt = 
+	struct packet pkt = 
 			packet_data_init(sbuf, 
 							 sizeof(struct ether_hdr) + sizeof(struct arp_hdr), 
 							 route->interface);
 	pkt.arp_hdr = (struct arp_hdr *)(pkt.buf + sizeof(struct ether_hdr));
 
-	/* Set ARP protocol type */
+	/* Set protocol type as ARP */
 	pkt.eth_hdr->ethr_type = htons(ETHERTYPE_ARP);
 
 	/* Set ARP protocol parameters */
@@ -192,7 +164,7 @@ void send_arp_request(struct route_table_entry *route) {
 	printf("Package sent as ARP request.\n");
 }
 
-void handle_arp_request(struct packet_data *pkt) {
+void handle_arp_request(struct packet *pkt) {
 	pkt->arp_hdr->opcode = htons(ARP_REPLY);
 
 	/* Swap the IP addresses */
@@ -213,7 +185,7 @@ void handle_arp_request(struct packet_data *pkt) {
 	printf("Package sent as ARP response.\n");
 }
 
-void handle_arp_reply(struct packet_data *pkt) {
+void handle_arp_reply(struct packet *pkt) {
 	/* Check if ARP entry already exists */
 	int exists = 0;
 	for (int i = 0; i < arp_table_len; i++) {
@@ -263,11 +235,11 @@ void handle_arp_reply(struct packet_data *pkt) {
 
 		printf("Package sent after ARP resolve.\n");
 
-		on_hold_packet_destory(wp);
+		destroy_waiting_packet(wp);
 	}
 }
 
-void handle_arp(struct packet_data *pkt) {
+void handle_arp(struct packet *pkt) {
 	printf("Handling ARP packet.\n");
 
 	pkt->arp_hdr = (struct arp_hdr *)(pkt->buf + sizeof(struct ether_hdr));
@@ -284,7 +256,25 @@ void handle_arp(struct packet_data *pkt) {
 	}
 }
 
-void handle_icmp(struct packet_data *pkt, uint8_t type, uint8_t code) {
+void packet_data_insert_icmp_hdr(struct packet *pkt) {
+	/* Shift memory in order to make space for the ICMP header */
+	memcpy(cpybuf, pkt->ip_hdr + sizeof(struct ip_hdr),
+		   sizeof(struct icmp_hdr));
+	memcpy(pkt->ip_hdr + sizeof(struct ip_hdr) + sizeof(struct icmp_hdr),
+		   cpybuf, sizeof(struct icmp_hdr));
+
+	pkt->icmp_hdr = (struct icmp_hdr *)(pkt->buf + sizeof(struct ether_hdr) +
+										sizeof(struct ip_hdr));
+
+	/* Update IPv4 header to accomodate ICMP */
+	pkt->ip_hdr->tot_len = htons(ntohs(pkt->ip_hdr->tot_len) +
+								 sizeof(struct icmp_hdr));
+	pkt->ip_hdr->proto = IPPROTO_ICMP;
+
+	pkt->len += sizeof(struct icmp_hdr);
+}
+
+void handle_icmp(struct packet *pkt, uint8_t type, uint8_t code) {
 	if (type) {
 		packet_data_insert_icmp_hdr(pkt);
 	}
@@ -318,7 +308,7 @@ void handle_icmp(struct packet_data *pkt, uint8_t type, uint8_t code) {
 	printf("Package sent as ICMP.\n");
 }
 
-int check_icmp_for_self(struct packet_data *pkt) {
+int check_icmp_for_self(struct packet *pkt) {
 	if (pkt->ip_hdr->dest_addr == inet_addr(get_interface_ip(pkt->interface))) {
 		pkt->icmp_hdr = (struct icmp_hdr *)(pkt->buf + 
 											sizeof(struct ether_hdr) +
@@ -328,7 +318,7 @@ int check_icmp_for_self(struct packet_data *pkt) {
 	return 0;
 }
 
-void handle_ipv4(struct packet_data *pkt) {
+void handle_ipv4(struct packet *pkt) {
 	printf("Handling IPv4 packet.\n");
 
 	pkt->ip_hdr = (struct ip_hdr *)(pkt->buf + sizeof(struct ether_hdr));
@@ -378,7 +368,7 @@ void handle_ipv4(struct packet_data *pkt) {
 			   route->next_hop);
 		
 		/* Add packet to queue */
-		struct waiting_packet *wp = on_hold_packet_init(pkt, route);
+		struct waiting_packet *wp = create_waiting_packet(pkt, route);
 		queue_enq(packet_queue, wp);
 
 		/* Send ARP request */
@@ -415,7 +405,7 @@ int main(int argc, char *argv[]) {
 
 		printf("Received packet\n");
 
-		struct packet_data pkt = packet_data_init(buf, len, interface);
+		struct packet pkt = packet_data_init(buf, len, interface);
 
 		/* Check for IPv4 or ARP packet, else drop packet. */
 		if (ntohs(pkt.eth_hdr->ethr_type) == ETHERTYPE_IP) {
@@ -427,5 +417,6 @@ int main(int argc, char *argv[]) {
 			continue;
 		}
 	}
+	destroy_trie(rtrie);
 }
 

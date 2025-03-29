@@ -20,6 +20,17 @@ route_trie create_trie(void)
     return t;
 }
 
+void destroy_trie(route_trie t)
+{
+    for (int i = 0; i < 2; i++) {
+        if (t->nodes[i] == NULL) {
+            continue;
+        }
+        destroy_trie(t->nodes[i]);
+    }
+    free(t);
+}
+
 void trie_insert(route_trie t, uint32_t prefix, uint32_t mask,
                  struct route_table_entry *route_entry)
 {

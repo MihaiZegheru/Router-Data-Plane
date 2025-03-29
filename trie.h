@@ -11,6 +11,9 @@ typedef struct route_trie *route_trie;
 /* Create an empty trie */
 extern route_trie create_trie(void);
 
+/* Recursively deletes a trie */
+void destroy_trie(route_trie t);
+
 /* Insert an element in the trie */
 void trie_insert(route_trie t, uint32_t prefix, uint32_t mask,
                  struct route_table_entry *route_entry);
